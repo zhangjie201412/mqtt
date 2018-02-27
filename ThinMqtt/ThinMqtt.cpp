@@ -34,6 +34,7 @@ ThinMqtt::ThinMqtt()
 ThinMqtt::~ThinMqtt()
 {
     //do something cleaner
+
 }
 
 bool ThinMqtt::setup(const char *host, int port)
@@ -46,7 +47,22 @@ bool ThinMqtt::setup(const char *host, int port)
         LOGE("%s: failed to create main thread\n", __func__);
         return false;
     }
+    ::pipe(mPipeFds);
     return true;
+}
+
+void ThinMqtt::release()
+{
+    int size = mClients.size();
+    for(int i = 0; i < size; i++) {
+        mClients[i]->status |= STATUS_DESTORY;
+        pthread_cond_signal(&mClients[i]->cond_v);
+        //wait client thread exit
+        pthread_join(mClients[i]->pid, NULL);
+        //::free(mClients[i]);
+    }
+    ::write(mPipeFds[1], "X", 1);
+    pthread_join(mMainThread, NULL);
 }
 
 int ThinMqtt::makeNoneBlock(int fd)
@@ -109,57 +125,24 @@ void *ThinMqtt::clientThread(void *ptr)
             client->available = false;
         }
 
-        char data;
-        rc = ::read(client->fd, &data, 1);
-        if(rc != 1) {
-            LOGE("%s: failed to read head\n", __func__);
-            break;
-        }
-        LOGD("%s: get head %02x\n", __func__, data);
-        ThinMQTTHeader header  = {0};
-        header.byte = data;
-        uint8_t type = header.bits.type;
-        LOGD("%s: type = %02x\n", __func__, type);
-
-        switch(type) {
-            case 0:
-                LOGE("%s: invalid type\n", __func__);
-                break;
-            case THIN_CONNECT:
-                data = THIN_CONNACK << 4 | 0x00;
-                ::write(client->fd, &data, 1);
-                client->status |= STATUS_CONNECTED;
-                break;
-            case THIN_PUBLISH:
-                data = THIN_PUBACK << 4 | 0x00;
-                ::write(client->fd, &data, 1);
-                break;
-            case THIN_PUBCOMP:
-                data = THIN_PUBACK << 4 | 0x00;
-                ::write(client->fd, &data, 1);
-                break;
-            case THIN_DISCONNECT:
-                data = THIN_DISCONNACK << 4 | 0x00;
-                ::write(client->fd, &data, 1);
-                client->status |= STATUS_DISCONNECT;
-                break;
-            default:
-                break;
-        }
-#if 0
-        int bytes = ::read(client->fd, recv, MAX_SIZE);
+        int bytes = ::read(client->fd, client->buffer + client->offset, CLIENT_BUFFER_SIZE);
         if(bytes < 0) {
             LOGE("%s: failed to read bytes: %s\n", __func__, ::strerror(errno));
+            client->available = false;
             continue;
         } else if(bytes == 0) {
-            LOGD("%s: maybe remote client closed\n", __func__);
+            LOGE("%s: maybe remote client closed\n", __func__);
             // destory the client
             client->status |= STATUS_DESTORY;
-            LOGD("%s: status = %x\n", __func__, client->status);
         } else {
-            LOGD("<<--- client %d recv %d bytes: %s\n", client->fd, bytes, recv);
+            client->offset += bytes;
+            if(client->buffer[client->offset - 1] == '\n') {
+                LOGD("<<--- client %d recv %d bytes: %s\n", client->fd,
+                        client->offset, client->buffer);
+            }
+            ::memset(client->buffer, 0x00, CLIENT_BUFFER_SIZE);
+            client->offset = 0;
         }
-#endif
     } while((client != NULL) 
         && ((client->status & STATUS_DESTORY) == 0));
     LOGD("%s: maybe remote client closed\n", __func__);
@@ -167,6 +150,7 @@ void *ThinMqtt::clientThread(void *ptr)
     client->status |= STATUS_DESTORY;
     LOGD("%s: status = %x\n", __func__, client->status);
     ::close(fd);
+    client->fd = -1;
     LOGD("%s: client %d exit!!!!\n", __func__, fd);
 
     return NULL;
@@ -181,11 +165,19 @@ void *ThinMqtt::mainThread(void *ptr)
     ThinMqtt *self = (ThinMqtt *)ptr;
     const int MAX_SIZE = 1024;
     uint8_t recv[MAX_SIZE];
+    int pipeRecvFd = self->mPipeFds[0];
 
     int rc;
     sock_id = ::socket(AF_INET, SOCK_STREAM, 0);
     if(sock_id < 0) {
         LOGE("%s: failed to create socket\n", __func__);
+        return NULL;
+    }
+
+    int reuse_on = 1;
+    if((::setsockopt(sock_id, SOL_SOCKET, SO_REUSEADDR,
+                    &reuse_on, sizeof(reuse_on))) < 0) {
+        LOGE("%s: failed to set socket address reuse\n", __func__);
         return NULL;
     }
 
@@ -202,7 +194,6 @@ void *ThinMqtt::mainThread(void *ptr)
                 self->mHost, self->mPort, ::strerror(errno));
         ::close(sock_id);
         return NULL;
-
     }
     if(self->makeNoneBlock(sock_id) < 0) {
         LOGE("%s: failed make none block\n", __func__);
@@ -240,6 +231,20 @@ void *ThinMqtt::mainThread(void *ptr)
     }
 
     events = (struct epoll_event *)::calloc(MAXEVENTS, sizeof(struct epoll_event));
+
+    //add pipe recv into poll list
+    if(self->makeNoneBlock(pipeRecvFd) < 0) {
+        LOGE("%s: failed make none block\n", __func__);
+        return NULL;
+    }
+    event.data.fd = pipeRecvFd;
+    event.events = EPOLLIN | EPOLLET;
+    rc = ::epoll_ctl(efd, EPOLL_CTL_ADD, pipeRecvFd, &event);
+    if(rc < 0) {
+        LOGE("%s:%d failed to epoll ctl\n", __func__, __LINE__);
+        return NULL;
+    }
+
     while(true) {
         int event_num, i;
 
@@ -251,6 +256,9 @@ void *ThinMqtt::mainThread(void *ptr)
             for(int j = 0; j < size; j++) {
                 if((self->mClients[j]->status & STATUS_DESTORY) != 0) {
                     LOGD("%s: remove client!\n", __func__);
+                    if(self->mClients[j]->fd > 0) {
+                        ::close(self->mClients[j]->fd);
+                    }
                     ::free(self->mClients[j]);
                     self->mClients[j] = NULL;
                     self->mClients.erase(self->mClients.begin() + j);
@@ -308,6 +316,8 @@ void *ThinMqtt::mainThread(void *ptr)
                     return NULL;
                 }
                 ::memset(client, 0x00, sizeof(ThinMQTTClient));
+                client->offset = 0;
+                ::memset(client->buffer, 0x00, CLIENT_BUFFER_SIZE);
                 client->fd = fd;
                 client->status = 0;
                 client->available = false;
@@ -327,6 +337,14 @@ void *ThinMqtt::mainThread(void *ptr)
                 LOGD("%s: add socket fd: %d, total %ld clients\n",
                         __func__, fd, self->mClients.size());
                 //TODO: Need to check clients ??
+            } else if(pipeRecvFd == events[i].data.fd) {
+                char byte;
+                rc = ::read(pipeRecvFd, &byte, 1);
+                if(rc == 1) {
+                    LOGD("%s: recv pipe data, need to exit the thread\n", __func__);
+                    ::close(sock_id);
+                }
+                return NULL;
             } else {
                 //data available
                 LOGD("%s: data available\n", __func__);

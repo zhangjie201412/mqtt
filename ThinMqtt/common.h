@@ -2,6 +2,8 @@
 #define __COMMON_H__
 
 #include <pthread.h>
+#include <unistd.h>
+#include <inttypes.h>
 
 #ifdef USE_SYSLOG
 #include <syslog.h>
@@ -16,7 +18,7 @@
 #endif
 
 #define THREAD_NAME_SIZE        16
-
+#define CLIENT_BUFFER_SIZE      1024 
 enum ThinMsgType {
     THIN_CONNECT = 1,
     THIN_CONNACK,
@@ -62,6 +64,15 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond_v;
     char threadName[THREAD_NAME_SIZE];
+    uint8_t buffer[CLIENT_BUFFER_SIZE];
+    uint32_t offset;
 } ThinMQTTClient;
+
+typedef struct {
+    int sync_id;
+    char client_id[32];
+    int length;
+    uint8_t data[0];
+} ThinMQTTMessage;
 
 #endif

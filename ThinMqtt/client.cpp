@@ -68,7 +68,7 @@ int main(void)
         ::close(sockfd);
         return -1;
     }
-#if 0
+#if 1
     rc = ::write(sockfd, "Hello\n", 6);
     if(rc < 0) {
         LOGE("Failed to write to server\n");
@@ -76,7 +76,7 @@ int main(void)
         return -1;
     }
 #endif
-    thin_mqtt_connect(sockfd);
+    //thin_mqtt_connect(sockfd);
 
     usleep(1000000);
     ::close(sockfd);

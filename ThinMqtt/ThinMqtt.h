@@ -16,6 +16,7 @@ public:
     static void *mainThread(void *ptr);
     static void *clientThread(void *ptr);
     bool setup(const char *addr, int port);
+    void release();
 private:
     int makeNoneBlock(int fd);
     int readPackage(ThinMQTTClient *client);
@@ -26,6 +27,7 @@ private:
     std::vector<ThinMQTTClient *> mClients;
     int mPort;
     char mHost[64];
+    int mPipeFds[2];
 };
 };
 
